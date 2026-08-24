@@ -215,6 +215,13 @@ function extractMarkerId(payload, prefix) {
   return match?.[1];
 }
 
+// PR #80: 辅助函数 - 检测转义的 marker（如 \137 代表 _）
+function isEscapedMarker(payload, markerPrefix) {
+  // 将 marker 中的 _ 转义为 \137
+  const escapedPrefix = markerPrefix.replace(/_/g, '\\137');
+  return payload.includes(escapedPrefix);
+}
+
 function shellQuoteForTest(value) {
   return `'${value.replace(/'/g, `'\\''`)}'`;
 }
@@ -226,6 +233,42 @@ function emitShellCommandResult(channel, commandId, output, exitCode) {
       `noise\r\n__MCP_BEGIN__${commandId}__\r\n${output}\n__MCP_END__${commandId}__RC__${exitCode}__\r\n$ `,
     ),
   );
+}
+
+// PR #80: 辅助函数 - 为 FakeShellChannel 设置标准的 marker 响应
+// 处理 __MCP_READY__ 和 __MCP_CONFIGURE__ 两种 probe
+// PR #80 转义了 marker 中的下划线（_ -> \137），所以需要检测转义形式
+function setupShellChannelMarkerHandling(channel, additionalHandler) {
+  channel.on('write', (payload) => {
+    // PR #80: marker 在 payload 中是转义的形式（\137 代表 _）
+    // 格式: printf '\137\137MCP\137READY\137\137{id}\137\137\n'
+    if (isEscapedMarker(payload, '__MCP_READY__')) {
+      const match = payload.match(/\\137\\137MCP\\137READY\\137\\137(.+?)\\137\\137/);
+      if (match) {
+        const readyId = match[1].replace(/\\137/g, '_');
+        setImmediate(() => {
+          channel.emit('data', Buffer.from(`__MCP_READY__${readyId}__\n`));
+        });
+        return;
+      }
+    }
+
+    if (isEscapedMarker(payload, '__MCP_CONFIGURE__')) {
+      const match = payload.match(/\\137\\137MCP\\137CONFIGURE\\137\\137(.+?)\\137\\137/);
+      if (match) {
+        const configureId = match[1].replace(/\\137/g, '_');
+        setImmediate(() => {
+          channel.emit('data', Buffer.from(`__MCP_CONFIGURE__${configureId}__\n`));
+        });
+        return;
+      }
+    }
+
+    // 调用额外的处理器（如果提供）
+    if (additionalHandler) {
+      additionalHandler(payload);
+    }
+  });
 }
 
 describe('SSH Connection Manager', () => {
@@ -982,14 +1025,7 @@ describe('SSH Connection Manager', () => {
   describe('Shell transport', () => {
     it('shell 模式连接初始化会进入 ready 流程', async () => {
       const channel = new FakeShellChannel();
-      channel.on('write', (payload) => {
-        const readyId = extractMarkerId(payload, '__MCP_READY__');
-        if (readyId) {
-          setImmediate(() => {
-            channel.emit('data', Buffer.from(`banner\r\n__MCP_READY__${readyId}__\r\n$ `));
-          });
-        }
-      });
+      setupShellChannelMarkerHandling(channel);
 
       const client = new FakeClient({
         onConnect: () => setImmediate(() => client.emit('ready')),
@@ -1010,22 +1046,15 @@ describe('SSH Connection Manager', () => {
       assert.strictEqual(client.shellCalls.length, 1);
       assert.strictEqual(manager.shellReady.get('shell'), true);
       assert.strictEqual(manager.getAllServerInfos()[0].connected, true);
-      assert.ok(channel.writes.some((payload) => payload.includes('__MCP_READY__')));
+      // PR #80: marker 现在是转义的形式
+      assert.ok(channel.writes.some((payload) => payload.includes('\\137\\137MCP\\137READY')));
     });
 
     it('shell 模式命令按队列串行执行', async () => {
       const channel = new FakeShellChannel();
       const commandIds = [];
 
-      channel.on('write', (payload) => {
-        const readyId = extractMarkerId(payload, '__MCP_READY__');
-        if (readyId) {
-          setImmediate(() => {
-            channel.emit('data', Buffer.from(`__MCP_READY__${readyId}__\n`));
-          });
-          return;
-        }
-
+      setupShellChannelMarkerHandling(channel, (payload) => {
         const commandId = extractMarkerId(payload, '__MCP_BEGIN__');
         if (commandId) {
           commandIds.push(commandId);
@@ -1067,16 +1096,8 @@ describe('SSH Connection Manager', () => {
       const channel = new FakeShellChannel();
       let seenScript = '';
 
-      channel.on('write', (payload) => {
+      setupShellChannelMarkerHandling(channel, (payload) => {
         seenScript = payload;
-
-        const readyId = extractMarkerId(payload, '__MCP_READY__');
-        if (readyId) {
-          setImmediate(() => {
-            channel.emit('data', Buffer.from(`__MCP_READY__${readyId}__\n`));
-          });
-          return;
-        }
 
         const commandId = extractMarkerId(payload, '__MCP_BEGIN__');
         if (commandId) {
@@ -1117,15 +1138,7 @@ describe('SSH Connection Manager', () => {
     it('shell 模式会清理 ANSI 和终端标题噪音', async () => {
       const channel = new FakeShellChannel();
 
-      channel.on('write', (payload) => {
-        const readyId = extractMarkerId(payload, '__MCP_READY__');
-        if (readyId) {
-          setImmediate(() => {
-            channel.emit('data', Buffer.from(`__MCP_READY__${readyId}__\n`));
-          });
-          return;
-        }
-
+      setupShellChannelMarkerHandling(channel, (payload) => {
         const commandId = extractMarkerId(payload, '__MCP_BEGIN__');
         if (commandId) {
           setImmediate(() => {
@@ -1159,15 +1172,7 @@ describe('SSH Connection Manager', () => {
     it('shell 模式会剥离开头残留的 BEGIN marker', async () => {
       const channel = new FakeShellChannel();
 
-      channel.on('write', (payload) => {
-        const readyId = extractMarkerId(payload, '__MCP_READY__');
-        if (readyId) {
-          setImmediate(() => {
-            channel.emit('data', Buffer.from(`__MCP_READY__${readyId}__\n`));
-          });
-          return;
-        }
-
+      setupShellChannelMarkerHandling(channel, (payload) => {
         const commandId = extractMarkerId(payload, '__MCP_BEGIN__');
         if (commandId) {
           setImmediate(() => {
@@ -1201,15 +1206,7 @@ describe('SSH Connection Manager', () => {
     it('shell 模式能正确识别非零退出码', async () => {
       const channel = new FakeShellChannel();
 
-      channel.on('write', (payload) => {
-        const readyId = extractMarkerId(payload, '__MCP_READY__');
-        if (readyId) {
-          setImmediate(() => {
-            channel.emit('data', Buffer.from(`__MCP_READY__${readyId}__\n`));
-          });
-          return;
-        }
-
+      setupShellChannelMarkerHandling(channel, (payload) => {
         const commandId = extractMarkerId(payload, '__MCP_BEGIN__');
         if (commandId) {
           setImmediate(() => emitShellCommandResult(channel, commandId, 'failed', 7));
@@ -1244,14 +1241,9 @@ describe('SSH Connection Manager', () => {
     it('shell 模式超时会返回固定错误', async () => {
       const channel = new FakeShellChannel();
 
-      channel.on('write', (payload) => {
-        const readyId = extractMarkerId(payload, '__MCP_READY__');
-        if (readyId) {
-          setImmediate(() => {
-            channel.emit('data', Buffer.from(`__MCP_READY__${readyId}__\n`));
-          });
-        }
-      });
+      // PR #80: 使用 setupShellChannelMarkerHandling 处理初始化
+      // 但不响应命令的 __MCP_BEGIN__，这样命令会超时
+      setupShellChannelMarkerHandling(channel);
 
       const client = new FakeClient({
         onConnect: () => setImmediate(() => client.emit('ready')),
@@ -1830,14 +1822,8 @@ describe('SSH Connection Manager', () => {
     }
 
     async function connectShell(channel, overrides = {}) {
-      channel.on('write', (payload) => {
-        const readyId = extractMarkerId(payload, '__MCP_READY__');
-        if (readyId) {
-          setImmediate(() => {
-            channel.emit('data', Buffer.from(`__MCP_READY__${readyId}__\n`));
-          });
-        }
-      });
+      // PR #80: 使用 setupShellChannelMarkerHandling 处理转义的 marker
+      setupShellChannelMarkerHandling(channel);
 
       const client = new FakeClient({
         onConnect: () => setImmediate(() => client.emit('ready')),

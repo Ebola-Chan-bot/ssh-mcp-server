@@ -115,7 +115,7 @@ digraph ssh_mcp_helper {
 | 堡垒机 / 跳板机 | `--transport-mode shell --shell-ready-timeout 15000` |
 | 多连接 | `--config-file /abs/path/ssh-config.json` |
 | 2FA / MFA | `--try-keyboard`（搭配密码 + 私钥） |
-| 命令白名单 | `--whitelist "^ls( .*)?,^cat .*"` |
+| 命令白名单 | `--whitelist "^ls(?: [A-Za-z0-9_./-]+)*$,^cat [A-Za-z0-9_./-]+$"` |
 | 命令黑名单 | `--blacklist "^rm .*,^shutdown.*"` |
 | 命令模板 | `--command-template "su root -c '<command>'"` |
 | 路径白名单 | `--allowed-local-paths` / `--allowed-remote-paths` |
@@ -145,7 +145,7 @@ digraph ssh_mcp_helper {
         "--port", "22",
         "--username", "root",
         "--password", "pwd123456",
-        "--whitelist", "^ls( .*)?,^cat .*"
+        "--whitelist", "^ls(?: [A-Za-z0-9_./-]+)*$,^cat [A-Za-z0-9_./-]+$"
       ]
     }
   }

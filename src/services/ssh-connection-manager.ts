@@ -1533,9 +1533,24 @@ export class SSHConnectionManager {
     const key = name || this.defaultName;
     const whitelistRegexes = this.commandWhitelistRegexes.get(key) || [];
     if (whitelistRegexes.length > 0) {
-      const matchesWhitelist = whitelistRegexes.some((regex) =>
-        regex.test(command),
-      );
+      // A whitelisted command is still executed by a remote shell. Do not let
+      // an allowed prefix authorize an appended command, pipeline, redirect,
+      // command substitution, background job, or newline-separated command.
+      // This is intentionally conservative: callers that need shell syntax
+      // should wrap it in a separately reviewed script and whitelist that
+      // script invocation instead.
+      if (/[;&|`<>\r\n]|\$\(/.test(command)) {
+        return {
+          isAllowed: false,
+          reason:
+            "Command contains shell control syntax forbidden by the whitelist",
+        };
+      }
+
+      const matchesWhitelist = whitelistRegexes.some((regex) => {
+        const match = regex.exec(command);
+        return match?.index === 0 && match[0] === command;
+      });
       if (!matchesWhitelist) {
         return {
           isAllowed: false,

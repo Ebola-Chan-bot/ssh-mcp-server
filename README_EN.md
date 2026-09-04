@@ -215,7 +215,7 @@ The existing `socksProxy` configuration and `--socksProxy` option remain support
 
 ### 6. 📝 Restricting Commands With Whitelist / Blacklist
 
-Use `--whitelist` and `--blacklist` to limit which commands the server is allowed to run. Patterns are comma-separated regular expressions. **Strongly recommended** for any production use.
+Use `--whitelist` and `--blacklist` to limit which commands the server is allowed to run. Patterns are comma-separated regular expressions. **Strongly recommended** for any production use. Whitelist patterns must match the entire command. When a whitelist is enabled, commands containing `;`, `&`, `|`, backticks, `$()`, `>`, `<`, or line breaks are rejected before matching, so shell chaining, pipelines, redirection, and command substitution cannot bypass validation.
 
 Whitelist example (only allow read-only inspection commands):
 
@@ -231,7 +231,7 @@ Whitelist example (only allow read-only inspection commands):
         "--port", "22",
         "--username", "root",
         "--password", "pwd123456",
-        "--whitelist", "^ls( .*)?,^cat .*,^df.*"
+        "--whitelist", "^ls(?: [A-Za-z0-9_./-]+)*$,^cat [A-Za-z0-9_./-]+$,^df(?: -[A-Za-z]+)*(?: [A-Za-z0-9_./-]+)?$"
       ]
     }
   }
@@ -259,7 +259,7 @@ Blacklist example (block destructive commands):
 }
 ```
 
-> Note: If both whitelist and blacklist are specified, the command must pass both checks (whitelist first, then blacklist) to be executed.
+> Note: If both whitelist and blacklist are specified, the command must fully match a whitelist pattern and must not match a blacklist pattern. Always use explicit `^` and `$` anchors in whitelist patterns to make them easy to read and audit. If several operations must be combined, put that logic in a separately reviewed script and whitelist only the fixed script invocation; do not try to parse shell syntax with simple string splitting.
 
 ### 7. 🧩 Wrapping Commands With a Template
 

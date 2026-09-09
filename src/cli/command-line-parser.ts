@@ -108,7 +108,7 @@ export class CommandLineParser {
         "transport-mode": { type: "string" },
         "shell-ready-timeout": { type: "string" },
         "command-template": { type: "string" },
-        pty: { type: "boolean" },
+        pty: { type: "string" },
         "try-keyboard": { type: "boolean" },
         "pre-connect": { type: "boolean" },
       },
@@ -227,7 +227,7 @@ export class CommandLineParser {
       const allowedLocalPaths = values["allowed-local-paths"];
       const allowedRemotePaths = values["allowed-remote-paths"];
       const commandTemplate = values["command-template"];
-      const pty = values.pty;
+      const pty = this.parseBoolean(values.pty);
       const tryKeyboard = values["try-keyboard"];
 
       // 实际连接地址：优先使用 SSH config 的 HostName
@@ -255,7 +255,7 @@ export class CommandLineParser {
         agent: resolvedAgent,
         proxy: values.proxy,
         socksProxy: values.socksProxy,
-        pty: pty !== undefined ? pty : undefined,
+        pty,
         tryKeyboard: tryKeyboard !== undefined ? tryKeyboard : undefined,
         transportMode: values["transport-mode"],
         shellReadyTimeoutMs: values["shell-ready-timeout"],

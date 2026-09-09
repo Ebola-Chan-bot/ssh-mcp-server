@@ -472,11 +472,18 @@ Host minimalhost
       assert.strictEqual(result.configs.default.shellReadyTimeoutMs, 15000);
     });
 
-    it('应该正确解析 --pty 选项', () => {
-      process.argv = ['node', 'test', '--host', '1.2.3.4', '--port', '22', '--username', 'user', '--password', 'pass', '--pty'];
+    it('应该正确解析 --pty true 选项', () => {
+      process.argv = ['node', 'test', '--host', '1.2.3.4', '--port', '22', '--username', 'user', '--password', 'pass', '--pty', 'true'];
       const result = CommandLineParser.parseArgs();
 
       assert.strictEqual(result.configs.default.pty, true);
+    });
+
+    it('应该正确解析 --pty false 选项', () => {
+      process.argv = ['node', 'test', '--host', '1.2.3.4', '--port', '22', '--username', 'user', '--password', 'pass', '--pty', 'false'];
+      const result = CommandLineParser.parseArgs();
+
+      assert.strictEqual(result.configs.default.pty, false);
     });
 
     it('应该正确解析配置文件中的字符串 false pty', () => {

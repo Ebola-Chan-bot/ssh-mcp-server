@@ -206,13 +206,22 @@ export class CommandLineParser {
       const portStr = values.port || positionals[1] || sshConfigEntry?.port?.toString() || "22";
       const username = values.username || positionals[2] || sshConfigEntry?.user;
       const password = values.password || positionals[3];
-      const privateKey = values.privateKey || sshConfigEntry?.identityFile;
+      // 私钥来源：命令行参数 > SSH config 的 IdentityFile
+      const privateKey =
+        values.privateKey || sshConfigEntry?.identityFile;
       const passphrase = values.passphrase || process.env.SSH_MCP_PASSPHRASE;
       const resolvedAgent = values.agent !== undefined
         ? values.agent
         : !password && !privateKey
-        ? process.env.SSH_AUTH_SOCK
+        ? findDefaultAgent()
         : undefined;
+
+      // OpenSSH 风格回退：SSH config 命中了主机别名，但没有提供任何认证信息（无 IdentityFile / password / agent）时，模仿 ssh 客户端自动尝试 ~/.ssh 下的默认身份文件（id_rsa、id_ecdsa、id_ed25519 等）
+      const defaultPrivateKey =
+        !privateKey && !password && !resolvedAgent && sshConfigEntry
+          ? findDefaultIdentityFile()
+          : undefined;
+      const effectivePrivateKey = privateKey || defaultPrivateKey;
       const whitelist = values.whitelist;
       const blacklist = values.blacklist;
       const allowedLocalPaths = values["allowed-local-paths"];
@@ -224,7 +233,7 @@ export class CommandLineParser {
       // 实际连接地址：优先使用 SSH config 的 HostName
       const actualHost = sshConfigEntry?.hostName || host;
 
-      if (!actualHost || !portStr || !username || (!password && !privateKey && !resolvedAgent)) {
+      if (!actualHost || !portStr || !username || (!password && !effectivePrivateKey && !resolvedAgent)) {
         throw new Error(
           "Missing required parameters, need to provide host, port, username and password, private key or agent"
         );
@@ -241,7 +250,7 @@ export class CommandLineParser {
         port,
         username,
         password,
-        privateKey,
+        privateKey: effectivePrivateKey,
         passphrase,
         agent: resolvedAgent,
         proxy: values.proxy,
@@ -464,4 +473,34 @@ export class CommandLineParser {
     }
     return normalized;
   }
+}
+
+/**
+ * 模仿 OpenSSH 的行为：当用户未显式指定私钥、密码或 agent 时，按惯例依次尝试 ~/.ssh 下的默认身份文件（id_rsa、id_ecdsa、id_ed25519、id_xmss、id_dsa），返回第一个存在的公钥对应的私钥路径，否则返回undefined。
+ */
+function findDefaultIdentityFile(): string | undefined {
+  const sshDir = path.join(os.homedir(), ".ssh");
+  const defaultNames = ["id_rsa", "id_ecdsa", "id_ed25519", "id_xmss", "id_dsa"];
+  for (const name of defaultNames) {
+    const candidate = path.join(sshDir, name);
+    if (fs.existsSync(candidate)) {
+      return candidate;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * 在未显式指定认证方式时寻找默认的 SSH agent：
+ * - 各平台都优先使用 SSH_AUTH_SOCK 环境变量
+ * - Windows 上额外检查 OpenSSH Authentication Agent 的命名管道
+ */
+function findDefaultAgent(): string | undefined {
+  if (process.env.SSH_AUTH_SOCK) {
+    return process.env.SSH_AUTH_SOCK;
+  }
+  if (process.platform === "win32" && fs.existsSync("\\\\.\\pipe\\openssh-ssh-agent")) {
+    return "\\\\.\\pipe\\openssh-ssh-agent";
+  }
+  return undefined;
 }

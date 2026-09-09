@@ -600,7 +600,7 @@ npx @fangjunjie/ssh-mcp-server \
   --transport-mode    SSH transport 模式: exec 或 shell（默认: exec）
   --shell-ready-timeout   shell 就绪探测超时，单位毫秒（默认: 10000）
   --command-template  命令模板；shell 参数用 <quotedCommand>，原样插入用 <command>
-  --pty               为命令执行分配伪终端（默认: true）
+  --pty <true|false>  为命令执行分配伪终端（默认: true）
   --pre-connect       启动时预连接所有配置的 SSH 服务器
   --version, -v       打印包版本
   --help              打印帮助信息

@@ -26,7 +26,7 @@ Options:
   --transport-mode <mode>          SSH transport mode: exec or shell (default: exec)
   --shell-ready-timeout <ms>       Shell readiness probe timeout (default: 10000)
   --command-template <template>    Wrap commands with <command> or <quotedCommand>
-  --pty                           Allocate pseudo-tty for exec mode commands (default: true)
+  --pty <true|false>              Allocate pseudo-tty for exec mode commands (default: true)
   --try-keyboard                  Enable keyboard-interactive authentication
   --pre-connect                   Pre-connect to all SSH servers on startup
   --version, -v                   Print package version

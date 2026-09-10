@@ -181,6 +181,32 @@ Host myserver
 
 **注意**：命令行参数优先级高于 SSH 配置值。例如，如果你指定了 `--port 2222`，它会覆盖 SSH 配置中的端口。
 
+#### 批量导入 SSH config 别名（多连接）
+
+`--ssh-config-hosts` 以逗号分隔多个已在 SSH config 中定义的主机别名，一次性导入为多连接模式。每台主机的 HostName、Port、User、IdentityFile 全部从 SSH config 展开，认证信息缺失时按 OpenSSH 惯例回退（默认身份文件、SSH agent）：
+
+```json
+{
+  "mcpServers": {
+    "ssh-mcp-server": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@fangjunjie/ssh-mcp-server",
+        "--ssh-config-hosts", "myserver,anotherserver",
+        "--pty", "false"
+      ]
+    }
+  }
+}
+```
+
+导入后每台主机以别名作为 `connectionName`，工具调用时用它路由；其余 CLI 参数（`--pty`、`--whitelist`、超时等）作为进程级默认值共享给全部主机。约束：
+
+- 与 `--host` / `--ssh` / `--config-file` 互斥，同时出现会报错
+- `--password` / `--privateKey` / `--agent` 不能与该参数同用（认证只来自 SSH config）；`--passphrase` 允许共享
+- 别名未在 SSH config 中命中，或命中但无任何认证来源时，启动即报错并列出别名
+
 ### 5. 🌐 通过代理连接
 
 当目标主机只能通过代理访问时，可使用 `--proxy` 配置 SOCKS5、HTTP 或 HTTPS 代理。
@@ -582,6 +608,7 @@ npx @fangjunjie/ssh-mcp-server \
 选项:
   --config-file       JSON 配置文件路径（推荐用于多服务器配置）
   --ssh-config-file   SSH 配置文件路径（默认: ~/.ssh/config）
+  --ssh-config-hosts  以逗号分隔的 SSH config 主机别名，批量导入为多连接
   --ssh               SSH 连接配置（可以是 JSON 字符串或旧格式）
   -h, --host          SSH 服务器主机地址或 SSH 配置中的别名
   -p, --port          SSH 服务器端口

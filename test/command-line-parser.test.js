@@ -430,6 +430,177 @@ Host minimalhost
     });
   });
 
+  describe('--ssh-config-hosts 批量导入', () => {
+    const multiSshConfigPath = () => path.join(fixturesDir, 'multi-ssh-config');
+    const writeMultiConfig = () => {
+      fs.writeFileSync(multiSshConfigPath(), `
+Host hosta
+    HostName 172.16.0.10
+    Port 2222
+    User usera
+    IdentityFile ~/.ssh/key_a
+
+Host hostb
+    HostName 172.16.0.11
+    User userb
+`);
+      return multiSshConfigPath();
+    };
+
+    it('应该批量导入多个 SSH config 别名并展开连接参数', () => {
+      const configPath = writeMultiConfig();
+      const originalSshAuthSock = process.env.SSH_AUTH_SOCK;
+      process.env.SSH_AUTH_SOCK = '/tmp/test-ssh-agent.sock';
+
+      try {
+        process.argv = [
+          'node', 'test',
+          '--ssh-config-hosts', 'hosta,hostb',
+          '--ssh-config-file', configPath,
+          '--pty', 'false',
+        ];
+        const result = CommandLineParser.parseArgs();
+
+        assert.strictEqual(Object.keys(result.configs).length, 2);
+
+        assert.strictEqual(result.configs.hosta.name, 'hosta');
+        assert.strictEqual(result.configs.hosta.host, '172.16.0.10');
+        assert.strictEqual(result.configs.hosta.port, 2222);
+        assert.strictEqual(result.configs.hosta.username, 'usera');
+        assert.ok(result.configs.hosta.privateKey.endsWith(path.join('.ssh', 'key_a')));
+        assert.strictEqual(result.configs.hosta.pty, false);
+
+        assert.strictEqual(result.configs.hostb.host, '172.16.0.11');
+        assert.strictEqual(result.configs.hostb.port, 22);
+        assert.strictEqual(result.configs.hostb.username, 'userb');
+        assert.strictEqual(result.configs.hostb.pty, false);
+      } finally {
+        if (originalSshAuthSock === undefined) {
+          delete process.env.SSH_AUTH_SOCK;
+        } else {
+          process.env.SSH_AUTH_SOCK = originalSshAuthSock;
+        }
+        fs.rmSync(configPath, { force: true });
+      }
+    });
+
+    it('多次给值与逗号混用应去重合并', () => {
+      const configPath = writeMultiConfig();
+      const originalSshAuthSock = process.env.SSH_AUTH_SOCK;
+      process.env.SSH_AUTH_SOCK = '/tmp/test-ssh-agent.sock';
+
+      try {
+        process.argv = [
+          'node', 'test',
+          '--ssh-config-hosts', 'hosta,hostb',
+          '--ssh-config-hosts', 'hosta',
+          '--ssh-config-file', configPath,
+        ];
+        const result = CommandLineParser.parseArgs();
+
+        assert.deepStrictEqual(
+          Object.keys(result.configs).sort(),
+          ['hosta', 'hostb'],
+        );
+      } finally {
+        if (originalSshAuthSock === undefined) {
+          delete process.env.SSH_AUTH_SOCK;
+        } else {
+          process.env.SSH_AUTH_SOCK = originalSshAuthSock;
+        }
+        fs.rmSync(configPath, { force: true });
+      }
+    });
+
+    it('与其他连接来源同现时应报错', () => {
+      const configPath = writeMultiConfig();
+
+      try {
+        process.argv = [
+          'node', 'test',
+          '--ssh-config-hosts', 'hosta',
+          '--host', '1.2.3.4',
+          '--ssh-config-file', configPath,
+        ];
+        assert.throws(() => CommandLineParser.parseArgs(), /Conflicting connection sources/);
+      } finally {
+        fs.rmSync(configPath, { force: true });
+      }
+    });
+
+    it('与 --password / --privateKey / --agent 同现时应报错', () => {
+      const configPath = writeMultiConfig();
+
+      try {
+        for (const authArg of [['--password', 'pw'], ['--privateKey', '~/.ssh/k'], ['--agent', '/tmp/a.sock']]) {
+          process.argv = [
+            'node', 'test',
+            '--ssh-config-hosts', 'hosta',
+            '--ssh-config-file', configPath,
+            ...authArg,
+          ];
+          assert.throws(() => CommandLineParser.parseArgs(), /Conflicting options.*--ssh-config-hosts/);
+        }
+      } finally {
+        fs.rmSync(configPath, { force: true });
+      }
+    });
+
+    it('别名未在 SSH config 中命中时应报错并列出别名', () => {
+      const configPath = writeMultiConfig();
+
+      try {
+        process.argv = [
+          'node', 'test',
+          '--ssh-config-hosts', 'hosta,ghosthost',
+          '--ssh-config-file', configPath,
+        ];
+        assert.throws(
+          () => CommandLineParser.parseArgs(),
+          /Host alias\(es\) not found in SSH config: ghosthost/,
+        );
+      } finally {
+        fs.rmSync(configPath, { force: true });
+      }
+    });
+
+    it('导入主机无任何认证来源时应报错并列出别名', () => {
+      const configPath = path.join(fixturesDir, 'noauth-ssh-config');
+      const originalSshAuthSock = process.env.SSH_AUTH_SOCK;
+      fs.writeFileSync(configPath, `
+Host noauthhost
+    HostName 172.16.0.12
+    User userc
+`);
+      delete process.env.SSH_AUTH_SOCK;
+
+      try {
+        process.argv = [
+          'node', 'test',
+          '--ssh-config-hosts', 'noauthhost',
+          '--ssh-config-file', configPath,
+        ];
+        // noauthhost 无 IdentityFile；~/.ssh 默认身份文件在测试机上可能
+        // 存在，存在时该用例退化为通过，因此仅在无默认密钥时断言报错
+        const hasDefaultIdentity = ['id_rsa', 'id_ecdsa', 'id_ed25519', 'id_xmss', 'id_dsa']
+          .some((name) => fs.existsSync(path.join(os.homedir(), '.ssh', name)));
+        if (!hasDefaultIdentity) {
+          assert.throws(
+            () => CommandLineParser.parseArgs(),
+            /No authentication source for host\(s\): noauthhost/,
+          );
+        }
+      } finally {
+        if (originalSshAuthSock === undefined) {
+          delete process.env.SSH_AUTH_SOCK;
+        } else {
+          process.env.SSH_AUTH_SOCK = originalSshAuthSock;
+        }
+        fs.rmSync(configPath, { force: true });
+      }
+    });
+  });
+
   describe('命令白名单和黑名单', () => {
     it('应该正确解析命令白名单', () => {
       process.argv = ['node', 'test', '--host', '1.2.3.4', '--port', '22', '--username', 'user', '--password', 'pass', '--whitelist', 'ls,cat,grep'];

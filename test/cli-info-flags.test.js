@@ -17,6 +17,7 @@ const packageJson = JSON.parse(
 const expectedHelpOptions = [
   '--config-file <path>',
   '--ssh-config-file <path>',
+  '--ssh-config-hosts <aliases>',
   '--ssh <config>',
   '-h, --host <host>',
   '-p, --port <port>',

@@ -90,6 +90,7 @@ export class CommandLineParser {
       options: {
         "config-file": { type: "string" },
         "ssh-config-file": { type: "string" },
+        "ssh-config-hosts": { type: "string", multiple: true },
         ssh: { type: "string", multiple: true },
         // Compatible with single connection legacy parameters
         host: { type: "string", short: "h" },
@@ -116,6 +117,47 @@ export class CommandLineParser {
     });
 
     const configMap: SshConnectionConfigMap = {};
+
+    // 连接定义来源互斥校验：--ssh-config-hosts 与任何其他来源显式同现时
+    // 直接报错，而不是静默丢弃其中一个。旧来源之间（--config-file /
+    // --ssh / --host）的历史静默优先行为保持不变，不在此处约束。
+    const sshConfigHostsRaw: string[] = Array.isArray(
+      values["ssh-config-hosts"],
+    )
+      ? values["ssh-config-hosts"]
+      : [];
+    if (sshConfigHostsRaw.length > 0) {
+      const otherSources: string[] = [];
+      if (values["config-file"]) otherSources.push("--config-file");
+      if (values.ssh) otherSources.push("--ssh");
+      if (values.host || positionals.length > 0) otherSources.push("--host");
+      if (otherSources.length > 0) {
+        throw new Error(
+          `Conflicting connection sources: --ssh-config-hosts cannot be ` +
+            `combined with ${otherSources.join(", ")}. Specify only one ` +
+            `connection source.`
+        );
+      }
+    }
+
+    // 认证身份类参数与 --ssh-config-hosts 互斥：该模式下认证信息
+    // （IdentityFile / 默认密钥 / agent）完全来自 SSH config，混用 CLI
+    // 认证参数会造成歧义，直接报错。--passphrase 是密钥解密口令而非
+    // 身份选择器，允许共享并作用于全部导入主机。
+    if (sshConfigHostsRaw.length > 0) {
+      const conflictingAuthParams: string[] = [];
+      if (values.password !== undefined) conflictingAuthParams.push("--password");
+      if (values.privateKey !== undefined) conflictingAuthParams.push("--privateKey");
+      if (values.agent !== undefined) conflictingAuthParams.push("--agent");
+      if (conflictingAuthParams.length > 0) {
+        throw new Error(
+          `Conflicting options: ${conflictingAuthParams.join(", ")} cannot be ` +
+            `combined with --ssh-config-hosts. Authentication for imported ` +
+            `hosts comes from SSH config (IdentityFile entries, default ` +
+            `identity files, or the SSH agent).`
+        );
+      }
+    }
 
     // Priority 1: Load from config file if specified
     if (values["config-file"]) {
@@ -185,6 +227,117 @@ export class CommandLineParser {
           throw new Error("Each --ssh must include name, host, port, username");
         }
         configMap[conf.name] = conf;
+      }
+    }
+
+    // Priority 2.5: Import hosts from SSH config via --ssh-config-hosts.
+    // 每个别名通过 lookupSshConfig 展开为完整连接（HostName/Port/User/
+    // IdentityFile），未命中即报错；CLI 的策略类参数（pty/白名单/超时等）
+    // 作为进程级默认值共享给全部导入主机。
+    if (Object.keys(configMap).length === 0 && sshConfigHostsRaw.length > 0) {
+      const aliases: string[] = [];
+      const seen = new Set<string>();
+      for (const raw of sshConfigHostsRaw) {
+        for (const alias of raw.split(",")) {
+          const trimmed = alias.trim();
+          if (trimmed && !seen.has(trimmed)) {
+            seen.add(trimmed);
+            aliases.push(trimmed);
+          }
+        }
+      }
+      if (aliases.length === 0) {
+        throw new Error(
+          "--ssh-config-hosts requires at least one host alias, e.g. --ssh-config-hosts host-a,host-b"
+        );
+      }
+
+      const passphrase = values.passphrase || process.env.SSH_MCP_PASSPHRASE;
+      const defaultAgent =
+        !values.passphrase && !passphrase ? findDefaultAgent() : undefined;
+      const whitelistPatterns = values.whitelist
+        ? values.whitelist
+            .split(",")
+            .map((pattern: string) => pattern.trim())
+            .filter(Boolean)
+        : undefined;
+      const blacklistPatterns = values.blacklist
+        ? values.blacklist
+            .split(",")
+            .map((pattern: string) => pattern.trim())
+            .filter(Boolean)
+        : undefined;
+      const allowedLocalPaths = values["allowed-local-paths"]
+        ? values["allowed-local-paths"]
+            .split(",")
+            .map((allowedPath: string) => allowedPath.trim())
+            .filter(Boolean)
+        : undefined;
+      const allowedRemotePaths = values["allowed-remote-paths"]
+        ? values["allowed-remote-paths"]
+            .split(",")
+            .map((allowedPath: string) => allowedPath.trim())
+            .filter(Boolean)
+        : undefined;
+      const sharedPolicy = {
+        passphrase,
+        proxy: values.proxy,
+        socksProxy: values.socksProxy,
+        pty: this.parseBoolean(values.pty),
+        tryKeyboard:
+          values["try-keyboard"] !== undefined
+            ? values["try-keyboard"]
+            : undefined,
+        transportMode: values["transport-mode"],
+        shellReadyTimeoutMs: values["shell-ready-timeout"],
+        commandTemplate: values["command-template"],
+        commandWhitelist: whitelistPatterns,
+        commandBlacklist: blacklistPatterns,
+        allowedLocalPaths,
+        allowedRemotePaths,
+      };
+
+      const missing: string[] = [];
+      const noAuth: string[] = [];
+      for (const alias of aliases) {
+        const entry = lookupSshConfig(alias, values["ssh-config-file"]);
+        if (!entry || !entry.hostName) {
+          missing.push(alias);
+          continue;
+        }
+
+        // 认证源：该别名的 IdentityFile，或 OpenSSH 风格默认身份文件，
+        // 或已运行的 SSH agent（与单主机模式的回退顺序一致）
+        const privateKey =
+          entry.identityFile || findDefaultIdentityFile() || undefined;
+        const agent = privateKey ? undefined : defaultAgent;
+        if (!privateKey && !agent) {
+          noAuth.push(alias);
+        }
+
+        configMap[alias] = this.normalizeConfig({
+          name: alias,
+          host: entry.hostName,
+          port: entry.port || 22,
+          username: entry.user,
+          privateKey,
+          agent,
+          ...sharedPolicy,
+        });
+      }
+
+      if (missing.length > 0) {
+        throw new Error(
+          `Host alias(es) not found in SSH config: ${missing.join(", ")}. ` +
+            `--ssh-config-hosts only imports aliases defined in the SSH config file.`
+        );
+      }
+      if (noAuth.length > 0) {
+        throw new Error(
+          `No authentication source for host(s): ${noAuth.join(", ")}. ` +
+            `Each imported host needs an IdentityFile entry, a default ` +
+            `identity file in ~/.ssh, or a running SSH agent.`
+        );
       }
     }
 

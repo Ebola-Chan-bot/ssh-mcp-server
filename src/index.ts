@@ -9,6 +9,7 @@ const HELP_TEXT = `Usage: ssh-mcp-server [options] [host port username password]
 Options:
   --config-file <path>             Load SSH server configs from a JSON file
   --ssh-config-file <path>         Read host aliases from SSH config (default: ~/.ssh/config)
+  --ssh-config-hosts <aliases>     Import comma-separated SSH config aliases as connections
   --ssh <config>                   Add an SSH config as JSON or legacy key=value pairs (repeatable)
   -h, --host <host>                SSH host or SSH config alias for single-host mode
   -p, --port <port>                SSH port for single-host mode

@@ -113,6 +113,7 @@ digraph ssh_mcp_helper {
 | 复用 ssh config 别名 | `--host <alias>` (+可选 `--ssh-config-file`) |
 | SOCKS 代理 | `--socksProxy socks://user:pwd@host:port` |
 | 堡垒机 / 跳板机 | `--transport-mode shell --shell-ready-timeout 15000` |
+| 私有设备 CLI（不认 printf 标记） | `--transport-mode file`（通道字节原样追加到临时日志文件，execute-command 返回文件路径与本命令输出的起始字节偏移；输出是活流、可能仍在增长，由智能体读文件自判完整性，必要时重读） |
 | 多连接 | `--config-file /abs/path/ssh-config.json` |
 | 2FA / MFA | `--try-keyboard`（搭配密码 + 私钥） |
 | 命令白名单 | `--whitelist "^ls(?: [A-Za-z0-9_./-]+)*$,^cat [A-Za-z0-9_./-]+$"` |
@@ -125,6 +126,7 @@ digraph ssh_mcp_helper {
 - ❌ 把 `"--host 192.168.1.1"` 当作一个 args 元素 → ✅ 拆成两个元素 `"--host", "192.168.1.1"`
 - ❌ 密码含 `{ } = ,` 等字符却用旧式 `--ssh "name=...,password=..."` → ✅ 改用 `--config-file` 或 JSON 形式 `--ssh`
 - ❌ `shell` 模式下还想用 `upload`/`download` → 该模式禁用 SFTP，需切回 `exec`
+- ❌ 设备 CLI 连 `printf` 探测都不认，`shell` 模式就绪超时 → ✅ 改用 `--transport-mode file`，并把返回的日志文件路径交给智能体自行读取
 - ❌ 直接覆盖用户既有 `mcpServers` 中的同名 key → 必须先读后合并，覆盖前显式确认
 - ❌ 直连生产环境却未配置 `--whitelist` / `--blacklist` → 必须主动提醒安全风险
 - ❌ 把私钥内容粘进配置 → 配置里应填**私钥文件路径**，凭据留在本地

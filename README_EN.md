@@ -300,7 +300,7 @@ docker exec -i mycontainer sh -c <quotedCommand>
 ssh jumphost <quotedCommand>
 ```
 
-### 8. 🚇 Bastion / Jump Host (`transportMode: shell`)
+### 8. 🚇 Bastion / Jump Host (`transportMode: shell` / `transportMode: file`)
 
 `transportMode` defaults to `exec`. Switch to `shell` when:
 
@@ -308,10 +308,12 @@ ssh jumphost <quotedCommand>
 - The remote side requires shell startup scripts, banners, or environment initialization first
 - The target effectively exposes only an interactive shell (bastion hosts, jump hosts, network devices)
 
-Behavior differences:
+Shell mode still relies on injecting `printf` markers on the remote side to frame command output. If the target is a private CLI appliance (switch, bastion appliance) that understands neither `printf` nor `stty` — so the readiness probe fails outright — use `file` mode instead (see next section).
+
+Behavior differences versus `exec`:
 
 - `exec`: supports `execute-command`, `upload`, and `download`
-- `shell`: runs commands through a persistent shell session with an internal command queue, but does **not** support `upload` / `download` because SFTP is unavailable in this mode
+- `shell` / `file`: run commands through a persistent shell session with an internal command queue, but do **not** support `upload` / `download` because SFTP is unavailable in these modes (`file` mode returns `UNSUPPORTED_IN_FILE_MODE`)
 
 ```json
 {
@@ -335,7 +337,47 @@ Behavior differences:
 
 In JSON config files you can also set `shellCommandTimeoutMs` to override the default per-command timeout for shell-backed connections.
 
-### 9. 🔐 Multi-Factor Authentication (2FA / MFA)
+### 9. 📄 Device CLI / Unframeable Output (`transportMode: file`)
+
+`file` mode is designed for targets whose output **cannot be framed with markers reliably** (private device CLIs, appliances): no `printf` readiness probe is sent, no `stty`/`PS1` markers are injected, and the command text is written raw to the persistent shell channel. Every byte received from the channel is appended **verbatim** to a random-GUID log file (`ssh-mcp-file-<uuid>.log`) created at instance startup in the system temp directory.
+
+`execute-command` returns the log file's absolute path and the **start byte offset of this command's output** (the file length captured before the command is sent — the only reliable anchor), and the agent reads from that offset onward with its own file tools. **Zero waiting, zero timeouts**: the channel is an unframed byte stream, and no idle window or command timeout can prove the device stopped responding, so the server never waits — the command is written and the result returns immediately. Timeout options are rejected outright in this mode (the per-call `timeout` parameter, as well as the `commandTimeoutMs`/`shellCommandTimeoutMs` settings — same policy as `--pty`). When output arrives and whether it is complete is for the agent to judge from the content itself (e.g. whether the device prompt has reappeared); if not, wait briefly and re-read the same file.
+
+```text
+[file mode] log: /tmp/ssh-mcp-file-9f8c...log
+[start] This command's output begins at byte offset 42; read from there to end of file.
+```
+
+Each result carries only these two factual lines (path + start offset); the usage guidance — output may still be arriving, how to judge completeness, when to re-read — lives in the `execute-command` tool description, which is injected once per session with the tool schema **and only appended when at least one connection is configured with `transportMode: file`** — exec/shell descriptions stay untouched, paying no context cost for irrelevant guidance.
+
+```json
+{
+  "mcpServers": {
+    "ssh-mcp-server": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@fangjunjie/ssh-mcp-server",
+        "--host", "device-cli.example.com",
+        "--port", "22",
+        "--username", "admin",
+        "--password", "pwd123456",
+        "--transport-mode", "file"
+      ]
+    }
+  }
+}
+```
+
+Notes:
+
+- Log files accumulate per instance and are **not auto-cleaned** (they live in the system temp directory); handle cleanup yourself for long-running instances
+- Device CLIs only execute commands and produce output when a PTY is present, so `file` mode always allocates a pseudo-tty and **rejects any `--pty`/`pty` setting** — specifying it explicitly (true or false) fails at startup
+- Likewise, `file` mode **accepts no command-level timeout**: the `commandTimeoutMs`/`shellCommandTimeoutMs` settings fail at startup and a per-call `timeout` fails the tool call (`COMMAND_VALIDATION_FAILED`) — the server never waits for output, so a timeout has no path to act on, and accepting one would only create the illusion of "a parameter that was taken but does nothing"
+- The returned start offset is based on the moment the command was sent: the login banner is also written to the file but precedes the first command's offset
+- The `list-servers` system-status probe (`uname`, etc.) is **automatically skipped** in `file` mode, both to avoid polluting the raw log and because those POSIX commands are meaningless to a device CLI anyway
+
+### 10. 🔐 Multi-Factor Authentication (2FA / MFA)
 
 When the SSH server requires multi-factor authentication (password + private key + 2FA verification code), enable `tryKeyboard`. The password and private key are auto-supplied. For non-password prompts, set `SSH_MCP_2FA_CODE` in the server environment before connecting.
 
@@ -364,7 +406,7 @@ When the SSH server requires multi-factor authentication (password + private key
 2. Password authentication (if provided)
 3. Keyboard-interactive for 2FA code via `SSH_MCP_2FA_CODE`
 
-### 10. 🧩 Managing Multiple SSH Connections
+### 11. 🧩 Managing Multiple SSH Connections
 
 When you need to expose more than one SSH target through the same MCP server, register them under unique connection names and select the target at call time via `connectionName`. There are four ways to configure them:
 
@@ -561,6 +603,7 @@ The `execute-command` tool supports timeout options to prevent commands from han
 - Set `commandTimeoutMs` per connection in the JSON config file to change that default, so callers do not have to pass `timeout` on every call (`exec` mode)
 - The `shell` mode equivalent is `shellCommandTimeoutMs`
 - A `timeout` passed with the call always takes precedence over both settings
+- `file` mode is the exception: there is no path that waits for output, so none of the command-level timeouts above apply — configuring or passing them is an error (see "9. Device CLI")
 - Connections use SSH keepalives by default (`keepaliveIntervalMs`: 10000, `keepaliveCountMax`: 3) and respect `connectionTimeoutMs` for connection setup
 - SFTP open and transfer operations respect `sftpTimeoutMs` (default 300000ms)
 - Error responses include stable `code`, `message`, and `retriable` fields for easier agent-side handling
@@ -620,10 +663,10 @@ Options:
   -s, --socksProxy    Legacy SOCKS5 proxy URL
   --allowed-local-paths   Additional allowed local paths for upload/download, comma-separated
   --allowed-remote-paths  Allowed remote (POSIX, absolute) paths for SFTP upload/download, comma-separated
-  --transport-mode    SSH transport mode: exec or shell (default: exec)
+  --transport-mode    SSH transport mode: exec, shell or file (default: exec)
   --shell-ready-timeout   Shell readiness probe timeout in milliseconds (default: 10000)
   --command-template  Command template, use <quotedCommand> for shell arguments or <command> for raw insertion
-  --pty               Allocate pseudo-tty for command execution (default: true)
+  --pty               Allocate pseudo-tty for command execution (default: true; file mode always allocates one and rejects this option at startup)
   --pre-connect       Pre-connect to all configured SSH servers on startup
   --version, -v       Print package version
   --help              Print this help message

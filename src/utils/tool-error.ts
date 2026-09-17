@@ -13,6 +13,7 @@ export type ToolErrorCode =
   | "OPERATION_TIMEOUT"
   | "SFTP_ERROR"
   | "UNSUPPORTED_IN_SHELL_MODE"
+  | "UNSUPPORTED_IN_FILE_MODE"
   | "UNKNOWN_ERROR";
 
 export class ToolError extends Error {

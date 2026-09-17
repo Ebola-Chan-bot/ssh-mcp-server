@@ -21,7 +21,7 @@ export interface SSHConfig {
   pty?: boolean; // Allocate pseudo-tty for command execution, default: true
   allowedLocalPaths?: string[]; // Allowed local paths for upload/download
   allowedRemotePaths?: string[]; // Allowed remote paths for SFTP upload/download (POSIX, absolute)
-  transportMode?: "exec" | "shell"; // SSH transport mode, default: exec
+  transportMode?: "exec" | "shell" | "file"; // SSH 传输模式，默认 exec。'file' 把原始 shell 通道追加写入本实例的临时日志文件，适用于输出无法用标记分帧的设备 CLI；发送命令后立即返回、不等待输出，commandTimeoutMs/shellCommandTimeoutMs 与调用级 timeout 在此模式下指定即报错
   shellReadyTimeoutMs?: number; // Shell readiness probe timeout, default: 10000ms
   shellCommandTimeoutMs?: number; // Shell command timeout override, default: 30000ms
   commandTimeoutMs?: number; // Exec command timeout override, default: 30000ms

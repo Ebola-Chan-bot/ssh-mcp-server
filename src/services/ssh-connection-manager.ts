@@ -9,7 +9,9 @@ import { Logger } from "../utils/logger.js";
 import { collectSystemStatus } from "../utils/status-collector.js";
 import { ToolError } from "../utils/tool-error.js";
 import fs from "fs";
+import os from "os";
 import path from "path";
+import { randomUUID } from "node:crypto";
 import type { Duplex } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { StringDecoder } from "node:string_decoder";
@@ -27,6 +29,16 @@ type ShellCommandMatch = {
   output: string;
   exitCode: number;
   remainder: string;
+};
+
+/**
+ * `file` 传输模式下每条连接的原始日志。通道监听器把收到的每个字节追加写入 `fd` 并推进 `bytesWritten`，后者同时充当各命令用来界定自己输出起点的偏移计数器。`writeFailed` 在首次追加出错后闭锁，避免磁盘写满或写权限被撤销时每个数据块都刷一条错误日志。
+ */
+type FileModeLog = {
+  path: string;
+  fd: number;
+  bytesWritten: number;
+  writeFailed: boolean;
 };
 
 /**
@@ -209,6 +221,7 @@ export class SSHConnectionManager {
   // A multi-byte character can be split across two TCP chunks, so the channel
   // needs one decoder for its whole lifetime rather than a decode per chunk.
   private shellDecoders: Map<string, StringDecoder> = new Map();
+  private fileModeLogs: Map<string, FileModeLog> = new Map();
   private defaultName: string = "default";
 
   private constructor() {}
@@ -362,13 +375,17 @@ export class SSHConnectionManager {
         );
 
         try {
-          if (this.getTransportMode(config) === "shell") {
+          const transportMode = this.getTransportMode(config);
+          if (transportMode === "shell" || transportMode === "file") {
             await this.initializeShellSession(client, key, config);
           }
 
           this.clients.set(key, client);
           this.connected.set(key, true);
-          this.scheduleStatusCollection(key);
+          if (transportMode !== "file") {
+            // 状态探测发送的是 POSIX 命令；file 模式的设备 CLI 既无法执行它们，这些尝试还会污染原始日志。
+            this.scheduleStatusCollection(key);
+          }
           resolveOnce();
         } catch (error) {
           this.connected.set(key, false);
@@ -595,13 +612,7 @@ export class SSHConnectionManager {
   ): Promise<string> {
     const config = this.getConfig(name);
     const key = name || this.defaultName;
-    if (this.getTransportMode(config) === "shell") {
-      throw new ToolError(
-        "UNSUPPORTED_IN_SHELL_MODE",
-        "Current bastion shell mode does not support SFTP upload/download.",
-        false,
-      );
-    }
+    this.assertSftpSupported(config);
 
     const validatedLocalPath = this.validateLocalPath(localPath, name, "read");
     const validatedRemotePath = this.validateRemotePath(remotePath, name);
@@ -684,13 +695,7 @@ export class SSHConnectionManager {
   ): Promise<string> {
     const config = this.getConfig(name);
     const key = name || this.defaultName;
-    if (this.getTransportMode(config) === "shell") {
-      throw new ToolError(
-        "UNSUPPORTED_IN_SHELL_MODE",
-        "Current bastion shell mode does not support SFTP upload/download.",
-        false,
-      );
-    }
+    this.assertSftpSupported(config);
 
     const validatedLocalPath = this.validateLocalPath(localPath, name, "write");
     const validatedRemotePath = this.validateRemotePath(remotePath, name);
@@ -1014,6 +1019,15 @@ export class SSHConnectionManager {
     this.shellQueues.clear();
     this.shellBuffers.clear();
     this.shellDecoders.clear();
+    // cleanupShellState 已经关闭了存在于 `clients` 中各 key 的 fd；这里再关闭残留项，避免日志项比其对应 client 存活更久时泄漏文件描述符。
+    for (const fileLog of this.fileModeLogs.values()) {
+      try {
+        fs.closeSync(fileLog.fd);
+      } catch {
+        // 断开连接时关闭出错则忽略。
+      }
+    }
+    this.fileModeLogs.clear();
   }
 
   /**
@@ -1066,7 +1080,8 @@ export class SSHConnectionManager {
     }
 
     const config = this.getConfig(key);
-    if (this.getTransportMode(config) === "shell") {
+    const transportMode = this.getTransportMode(config);
+    if (transportMode === "shell" || transportMode === "file") {
       return (
         this.shellReady.get(key) === true && this.shellStreams.has(key)
       );
@@ -1075,8 +1090,27 @@ export class SSHConnectionManager {
     return true;
   }
 
-  private getTransportMode(config: SSHConfig): "exec" | "shell" {
+  private getTransportMode(config: SSHConfig): "exec" | "shell" | "file" {
     return config.transportMode || "exec";
+  }
+
+  private assertSftpSupported(config: SSHConfig): void {
+    const transportMode = this.getTransportMode(config);
+    if (transportMode === "exec") {
+      return;
+    }
+    if (transportMode === "shell") {
+      throw new ToolError(
+        "UNSUPPORTED_IN_SHELL_MODE",
+        "Current bastion shell mode does not support SFTP upload/download.",
+        false,
+      );
+    }
+    throw new ToolError(
+      "UNSUPPORTED_IN_FILE_MODE",
+      "File transport mode does not support SFTP upload/download.",
+      false,
+    );
   }
 
   private getShellReadyTimeoutMs(config: SSHConfig): number {
@@ -1641,11 +1675,6 @@ export class SSHConnectionManager {
     const key = name || this.defaultName;
     const config = this.getConfig(name);
     const transportMode = this.getTransportMode(config);
-    const timeout =
-      options.timeout ??
-      (transportMode === "shell"
-        ? this.getShellCommandTimeoutMs(config)
-        : this.getCommandTimeoutMs(config));
     const connectionTimeoutMs = this.getConnectionTimeoutMs(config);
     const client = await this.withTimeout(
       this.ensureConnected(name),
@@ -1653,6 +1682,24 @@ export class SSHConnectionManager {
       () => this.invalidateConnection(key),
       `SSH connection [${key}] timed out after ${connectionTimeoutMs}ms`,
     );
+
+    if (transportMode === "file") {
+      // file 传输零等待：发送命令后立即返回，不解析输出、无法判定终点，timeout 没有可作用的等待路径。与配置级拒绝同纪律，调用级显式传入也直接报错，而不是静默忽略。
+      if (options.timeout !== undefined) {
+        throw new ToolError(
+          "COMMAND_VALIDATION_FAILED",
+          `transportMode "file" connection [${key}] does not accept the timeout parameter (got: ${String(options.timeout)}); file transport never waits for output, remove it from the call`,
+          false,
+        );
+      }
+      return this.runFileModeCommand(cmdString, directory, name);
+    }
+
+    const timeout =
+      options.timeout ??
+      (transportMode === "exec"
+        ? this.getCommandTimeoutMs(config)
+        : this.getShellCommandTimeoutMs(config));
 
     if (transportMode === "shell") {
       return this.runShellCommand(cmdString, directory, name, timeout);
@@ -1915,9 +1962,11 @@ export class SSHConnectionManager {
     key: string,
     config: SSHConfig,
   ): Promise<void> {
+    // ssh2 仅在 wndopts === false 时跳过 pty-req，传 undefined 仍会带默认窗口参数申请 PTY，因此无 PTY 必须显式传 false；config.pty 未设置时 shell 传输保持原行为（申请 PTY）。
+    const usePty = config.pty !== false;
     const stream = await new Promise<ClientChannel>((resolve, reject) => {
       client.shell(
-        { term: "xterm" },
+        usePty ? { term: "xterm" } : false,
         (err: Error | undefined, channel: ClientChannel) => {
           if (err) {
             reject(
@@ -1937,6 +1986,26 @@ export class SSHConnectionManager {
     this.shellStreams.set(key, stream);
     this.shellReady.set(key, false);
     this.shellQueues.set(key, Promise.resolve());
+
+    if (this.getTransportMode(config) === "file") {
+      // file 传输面向既不认 printf 就绪探测、也不认 `stty`/`PS1` 配置的设备 CLI，因此两者全部跳过，原始通道字节本身就是产物：设备输出的所有内容都追加进本实例的日志文件。
+      try {
+        this.createFileModeLog(key, stream);
+        this.shellReady.set(key, true);
+        this.attachShellLifecycleListeners(key, stream);
+      } catch (error) {
+        this.cleanupShellState(key, true);
+        throw new ToolError(
+          "SSH_CONNECTION_FAILED",
+          `File transport initialization failed for [${key}]: ${
+            (error as Error).message
+          }`,
+          true,
+        );
+      }
+      return;
+    }
+
     this.shellBuffers.set(key, "");
     this.shellDecoders.set(key, new StringDecoder("utf8"));
 
@@ -2296,6 +2365,61 @@ export class SSHConnectionManager {
     });
   }
 
+  private runFileModeCommand(
+    cmdString: string,
+    directory: string | undefined,
+    name: string | undefined,
+  ): Promise<string> {
+    const key = name || this.defaultName;
+    return this.enqueueShellCommand(key, () =>
+      this.executeFileModeCommand(key, cmdString, directory),
+    );
+  }
+
+  /**
+   * file 传输：命令原文直发（不加标记、不做探测——目标通常两者都不认，是私有设备 CLI），并报告其输出在日志文件中的起始位置。零等待、零超时：通道是无分帧的字节流，任何 idle 窗口或命令超时都无法证明设备已停止响应，是服务端无法兑现的虚假承诺。发送命令后立即返回路径与起点偏移，输出何时到达、是否完整全部由智能体读文件自行判断（其提示符重新出现即完整），不完整则稍候重读。
+   */
+  private executeFileModeCommand(
+    key: string,
+    cmdString: string,
+    directory: string | undefined,
+  ): Promise<string> {
+    const stream = this.shellStreams.get(key);
+    const fileLog = this.fileModeLogs.get(key);
+    if (!stream || this.shellReady.get(key) !== true || !fileLog) {
+      throw new ToolError(
+        "SSH_CONNECTION_FAILED",
+        `File transport for [${key}] is not ready`,
+        true,
+      );
+    }
+
+    const config = this.getConfig(key);
+    let commandBody = directory
+      ? `cd -- ${shellQuote(directory)} && { ${cmdString}; }`
+      : cmdString;
+    if (config.commandTemplate) {
+      commandBody = applyCommandTemplate(config.commandTemplate, commandBody);
+    }
+
+    // 唯一可靠的锚点：发送命令前捕获的文件长度。从该偏移起的全部内容都属于本条命令的流。
+    const startOffset = fileLog.bytesWritten;
+    stream.write(`${commandBody}\n`);
+    return Promise.resolve(
+      this.formatFileModeResult(fileLog.path, startOffset),
+    );
+  }
+
+  /**
+   * 格式化 file 模式的返回值。刻意保持最小化（路径 + 起始偏移）：使用说明放在 execute-command 工具描述里随会话注入一次，而不是在每次结果中重复。这里只出现单次调用的事实数据；日志是持续增长、没有可靠结束标记的活字节流，服务端计算出的任何"长度"都会是假的。
+   */
+  private formatFileModeResult(logPath: string, startOffset: number): string {
+    return [
+      `[file mode] log: ${logPath}`,
+      `[start] This command's output begins at byte offset ${startOffset}; read from there to end of file.`,
+    ].join("\n");
+  }
+
   private buildShellCommandScript(
     commandId: string,
     cmdString: string,
@@ -2443,6 +2567,48 @@ export class SSHConnectionManager {
     scanState.countedOutputEndIndex = endIndex;
   }
 
+  /**
+   * 为 file 传输连接创建本实例的原始日志，并挂上把收到的每个字节都追加写入的通道监听器。字节原样写入（不剥离 ANSI、不做解码）：文件是通道的忠实记录，由消费方自己按字节偏移切片。
+   */
+  private createFileModeLog(key: string, stream: ClientChannel): void {
+    const logPath = path.join(os.tmpdir(), `ssh-mcp-file-${randomUUID()}.log`);
+    const fd = fs.openSync(logPath, "a");
+    const fileLog: FileModeLog = {
+      path: logPath,
+      fd,
+      bytesWritten: 0,
+      writeFailed: false,
+    };
+    this.fileModeLogs.set(key, fileLog);
+    Logger.log(`File transport log for [${key}] opened at ${logPath}`, "info");
+
+    stream.on("data", (chunk: Buffer) => {
+      if (fileLog.writeFailed) {
+        return;
+      }
+      try {
+        let written = 0;
+        while (written < chunk.length) {
+          written += fs.writeSync(
+            fileLog.fd,
+            chunk,
+            written,
+            chunk.length - written,
+          );
+        }
+        fileLog.bytesWritten += written;
+      } catch (error) {
+        fileLog.writeFailed = true;
+        Logger.log(
+          `Failed to append to file transport log ${fileLog.path}: ${
+            (error as Error).message
+          }`,
+          "error",
+        );
+      }
+    });
+  }
+
   /** Appends the decoded chunk and returns just that text. */
   private appendShellBuffer(key: string, chunk: Buffer): string {
     let decoder = this.shellDecoders.get(key);
@@ -2493,6 +2659,17 @@ export class SSHConnectionManager {
       } catch {
         // Ignore shell close errors during cleanup.
       }
+    }
+
+    // 关闭原始日志的 fd，但保留磁盘上的文件：它位于临时目录，可能还留有调用方想读取的输出。
+    const fileLog = this.fileModeLogs.get(key);
+    if (fileLog) {
+      try {
+        fs.closeSync(fileLog.fd);
+      } catch {
+        // 清理时关闭出错则忽略。
+      }
+      this.fileModeLogs.delete(key);
     }
 
     this.shellStreams.delete(key);

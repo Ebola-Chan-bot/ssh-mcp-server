@@ -304,7 +304,7 @@ docker exec -i mycontainer sh -c <quotedCommand>
 ssh jumphost <quotedCommand>
 ```
 
-### 8. 🚇 堡垒机 / 跳板机（`transportMode: shell`）
+### 8. 🚇 堡垒机 / 跳板机（`transportMode: shell` / `transportMode: file`）
 
 `transportMode` 默认是 `exec`。出现下面这些情况时，应该切换到 `shell`：
 
@@ -312,10 +312,12 @@ ssh jumphost <quotedCommand>
 - 远端必须等登录 banner、profile、环境初始化完成后才能正常执行命令
 - 连接目标本质上是堡垒机或只暴露交互式 shell 的设备
 
-两者差异：
+而 `shell` 模式仍依赖在远端注入 `printf` 标记来拆分命令输出。如果目标是私有 CLI 设备（如交换机 / 堡垒机 Appliance），连 `printf`、`stty` 都不认，就绪探测直接失败，则应改用 `file` 模式（见下节）。
+
+与 `exec` 的差异：
 
 - `exec`：支持 `execute-command`、`upload`、`download`
-- `shell`：命令通过持久 shell 会话串行执行，内部带命令队列；但**不支持** `upload` / `download`，因为该模式下禁用了 SFTP
+- `shell` / `file`：命令通过持久 shell 会话串行执行，内部带命令队列；但**不支持** `upload` / `download`，因为均禁用了 SFTP（`file` 模式返回 `UNSUPPORTED_IN_FILE_MODE`）
 
 ```json
 {
@@ -339,7 +341,48 @@ ssh jumphost <quotedCommand>
 
 JSON 配置文件中还可以通过 `shellCommandTimeoutMs` 覆盖 shell 模式下单条命令的默认超时。
 
-### 9. 🔐 多因素认证（2FA / MFA）
+### 9. 📄 设备 CLI / 无标记输出（`transportMode: file`）
+
+`file` 模式为**无法用标记可靠拆分输出**的目标设计（私有设备 CLI、Appliance 等）：不发送 `printf` 就绪探测、不注入 `stty`/`PS1` 标记，命令原文直写持久 shell 通道；通道收到的全部字节**原样**追加到实例启动时在系统临时目录创建的随机 GUID 日志文件（`ssh-mcp-file-<uuid>.log`）。
+
+`execute-command` 返回日志文件绝对路径与**本条命令输出的起始字节偏移**（发送命令前的文件长度，唯一可靠锚点），由智能体自行用文件读取工具从该偏移读起。**零等待、零超时**：通道是无分帧字节流，任何 idle 窗口或命令超时都无法证明设备已停止响应，因此服务端不做任何等待——命令发出后立即返回；超时类选项在此模式下指定即报错（调用参数 `timeout`，以及配置项 `commandTimeoutMs`/`shellCommandTimeoutMs`，与 `--pty` 同级别拒绝）；输出何时到达、是否完整全部由智能体读内容自行判断（如设备提示符是否已重新出现），未完整则稍候重读同一文件。
+
+```text
+[file mode] log: C:\Users\...\Temp\ssh-mcp-file-9f8c...log
+[start] This command's output begins at byte offset 42; read from there to end of file.
+```
+
+每次返回只包含这两行事实数据（路径 + 起点）；关于"输出可能仍在到达、如何判断完整性、何时重读"的使用指引放在 `execute-command` 工具的描述文本里，随 tool schema **每会话只注入一次**，且**仅当任一连接配置了 `transportMode: file` 时才附加**——exec/shell 模式的描述保持原样，不为无关说明付出任何上下文成本。
+
+
+```json
+{
+  "mcpServers": {
+    "ssh-mcp-server": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@fangjunjie/ssh-mcp-server",
+        "--host", "device-cli.example.com",
+        "--port", "22",
+        "--username", "admin",
+        "--password", "pwd123456",
+        "--transport-mode", "file"
+      ]
+    }
+  }
+}
+```
+
+注意事项：
+
+- 日志文件按实例累积且**不自动清理**（位于系统临时目录），长期运行需自行处理
+- 设备 CLI 需要 PTY 才会执行命令并产生输出，因此 `file` 模式恒分配伪终端，**不接受 `--pty`/`pty` 指定**，显式传入（无论 true/false）会在启动时报错
+- 同理，`file` 模式**不接受任何命令级超时**：配置项 `commandTimeoutMs`/`shellCommandTimeoutMs` 在启动时报错，调用参数 `timeout` 在工具调用时报错（`COMMAND_VALIDATION_FAILED`）——服务端不等待输出，超时没有可作用的路径，接受它只会制造“参数被采纳却不生效”的错觉
+- 返回的起始偏移以连接建立后为基线：登录 banner 也写入文件，但位于第一条命令的偏移之前
+- `list-servers` 的系统状态采集（`uname` 等探测命令）在 `file` 模式下**自动跳过**，避免污染原始日志且这些 POSIX 命令设备 CLI 根本不认
+
+### 10. 🔐 多因素认证（2FA / MFA）
 
 当 SSH 服务器要求多因素认证（密码 + 私钥 + 2FA 验证码）时启用 `tryKeyboard`。密码和私钥会自动提供；对于非密码提示，请在连接前通过服务端环境变量 `SSH_MCP_2FA_CODE` 提供验证码。
 
@@ -368,7 +411,7 @@ JSON 配置文件中还可以通过 `shellCommandTimeoutMs` 覆盖 shell 模式�
 2. 密码认证（如果提供）
 3. 键盘交互式认证通过 `SSH_MCP_2FA_CODE` 提供 2FA 验证码
 
-### 10. 🧩 多 SSH 连接配置
+### 11. 🧩 多 SSH 连接配置
 
 需要在同一个 MCP server 里同时管理多个 SSH 目标时，给每个连接命名，调用时通过 `connectionName` 选择。共有四种配置方式：
 
@@ -567,6 +610,7 @@ npx @fangjunjie/ssh-mcp-server \
 - 在 JSON 配置文件里为单个连接设置 `commandTimeoutMs`，可以改掉这个默认值，避免每次调用都手动传 `timeout`（`exec` 模式）
 - `shell` 模式对应的配置项是 `shellCommandTimeoutMs`
 - 调用参数里的 `timeout` 始终优先于上面两个配置项
+- `file` 模式例外：不存在等待输出的路径，上述命令级超时均不适用，配置或传入都会报错（见「9. 设备 CLI」）
 - 连接默认启用 SSH keepalive（`keepaliveIntervalMs`: 10000，`keepaliveCountMax`: 3），并使用 `connectionTimeoutMs` 限制连接建立时间
 - SFTP 打开和传输操作使用 `sftpTimeoutMs` 控制超时（默认 300000ms）
 - 错误响应现在包含稳定的 `code`、`message`、`retriable` 字段，便于上层 Agent 处理
@@ -626,10 +670,10 @@ npx @fangjunjie/ssh-mcp-server \
   -s, --socksProxy    旧版 SOCKS5 代理地址（兼容参数）
   --allowed-local-paths   upload/download 允许访问的额外本地路径，逗号分隔
   --allowed-remote-paths  SFTP upload/download 允许访问的远端路径（POSIX 绝对路径），逗号分隔
-  --transport-mode    SSH transport 模式: exec 或 shell（默认: exec）
+  --transport-mode    SSH transport 模式: exec、shell 或 file（默认: exec）
   --shell-ready-timeout   shell 就绪探测超时，单位毫秒（默认: 10000）
   --command-template  命令模板；shell 参数用 <quotedCommand>，原样插入用 <command>
-  --pty <true|false>  为命令执行分配伪终端（默认: true）
+  --pty <true|false>  为命令执行分配伪终端（默认: true；file 模式恒开且不接受指定，传入即启动报错）
   --pre-connect       启动时预连接所有配置的 SSH 服务器
   --version, -v       打印包版本
   --help              打印帮助信息

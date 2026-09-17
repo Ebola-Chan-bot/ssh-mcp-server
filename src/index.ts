@@ -23,10 +23,10 @@ Options:
   -s, --socksProxy <url>           Legacy SOCKS5 proxy URL
   --allowed-local-paths <paths>    Extra allowed local paths, comma-separated
   --allowed-remote-paths <paths>   Allowed remote POSIX absolute paths, comma-separated
-  --transport-mode <mode>          SSH transport mode: exec or shell (default: exec)
+  --transport-mode <mode>          SSH transport mode: exec, shell or file (default: exec)
   --shell-ready-timeout <ms>       Shell readiness probe timeout (default: 10000)
   --command-template <template>    Wrap commands with <command> or <quotedCommand>
-  --pty <true|false>              Allocate pseudo-tty for exec mode commands (default: true)
+  --pty <true|false>              Allocate pseudo-tty for exec/shell commands; file mode always allocates a pseudo-tty and rejects this option (default: true)
   --try-keyboard                  Enable keyboard-interactive authentication
   --pre-connect                   Pre-connect to all SSH servers on startup
   --version, -v                   Print package version

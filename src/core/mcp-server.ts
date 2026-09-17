@@ -23,9 +23,10 @@ export class SshMcpServer {
 
   /**
    * Register tools
+   * @param fileModeNote 是否存在至少一条使用 file 传输模式的连接；透传下去，使 execute-command 仅在确实相关时才注入 file 模式使用说明
    */
-  private registerTools(): void {
-    registerAllTools(this.server);
+  private registerTools(fileModeNote: boolean): void {
+    registerAllTools(this.server, fileModeNote);
   }
 
   private async shutdown(reason: string, exitCode?: number): Promise<void> {
@@ -80,8 +81,13 @@ export class SshMcpServer {
     this.sshManager.setConfig(parsedArgs.configs);
     this.registerShutdownHandlers();
 
+    // 仅当至少一条连接使用 file 传输时，才把 file 模式使用说明注入 execute-command 的工具描述。
+    const fileModeNote = Object.values(parsedArgs.configs).some(
+      (c) => c.transportMode === "file",
+    );
+
     // Register tools before accepting MCP requests.
-    this.registerTools();
+    this.registerTools(fileModeNote);
 
     // Create transport instance and connect.
     const transport = new StdioServerTransport();

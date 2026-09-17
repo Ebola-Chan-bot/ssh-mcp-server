@@ -38,12 +38,12 @@ export class CommandLineParser {
       return undefined;
     }
 
-    if (value === "exec" || value === "shell") {
+    if (value === "exec" || value === "shell" || value === "file") {
       return value;
     }
 
     throw new Error(
-      `transportMode must be either 'exec' or 'shell', got: ${String(value)}`,
+      `transportMode must be one of 'exec', 'shell' or 'file', got: ${String(value)}`,
     );
   }
 
@@ -473,6 +473,31 @@ export class CommandLineParser {
       throw new Error(`Port must be a valid number, got: ${config.port}`);
     }
 
+    const transportMode =
+      this.parseTransportMode(config.transportMode) ||
+      this.DEFAULT_TRANSPORT_MODE;
+    const pty = this.parseBoolean(config.pty);
+
+    // file 模式不允许显式指定 pty：设备 CLI 依赖 PTY 才会执行命令并产生输出（无 tty 时目标静默不响应），该模式下内部固定按 true 处理，显式传值一律报错以免产生"参数被接受却不生效"或"生效即失联"的歧义。
+    if (transportMode === "file" && pty !== undefined) {
+      throw new Error(
+        `transportMode "file" does not accept the pty option (got: ${String(config.pty)}); file transport always allocates a PTY, remove --pty or use exec/shell mode to control it`,
+      );
+    }
+
+    // file 模式不接受任何命令级超时：服务端发送命令后立即返回、不等待输出，超时在此模式下没有可作用的等待路径，配置即误导，与 pty 同级别在启动时拒绝。
+    if (transportMode === "file") {
+      const rejectedTimeoutFields = [
+        "commandTimeoutMs",
+        "shellCommandTimeoutMs",
+      ].filter((field) => config[field] !== undefined);
+      if (rejectedTimeoutFields.length > 0) {
+        throw new Error(
+          `transportMode "file" does not accept command timeout options (got: ${rejectedTimeoutFields.join(", ")}); file transport never waits for output, remove them or use exec/shell mode to control timeouts`,
+        );
+      }
+    }
+
     return {
       name: config.name,
       host: config.host,
@@ -487,11 +512,9 @@ export class CommandLineParser {
       algorithms: config.algorithms,
       proxy: config.proxy,
       socksProxy: config.socksProxy,
-      pty: this.parseBoolean(config.pty),
+      pty: transportMode === "file" ? true : pty,
       tryKeyboard: this.parseBoolean(config.tryKeyboard),
-      transportMode:
-        this.parseTransportMode(config.transportMode) ||
-        this.DEFAULT_TRANSPORT_MODE,
+      transportMode,
       shellReadyTimeoutMs:
         this.parseTimeout(
           config.shellReadyTimeoutMs,

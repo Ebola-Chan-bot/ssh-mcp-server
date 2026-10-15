@@ -1,5 +1,5 @@
 import { createRequire } from "node:module";
-import type { Client, ClientChannel, SFTPWrapper, Stats } from "ssh2";
+import type { Client, ClientChannel, Prompt, SFTPWrapper, Stats } from "ssh2";
 import {
   SSHConfig,
   SshConnectionConfigMap,
@@ -72,6 +72,16 @@ type SshAuthMethod =
   | "agent"
   | "keyboard-interactive"
   | "hostbased";
+
+type SshClientConfig = Record<string, unknown> & {
+  keyboard?: (
+    name: string,
+    instructions: string,
+    instructionsLang: string,
+    prompts: Prompt[],
+    finish: (responses: string[]) => void,
+  ) => void;
+};
 
 const ANSI_OSC_PATTERN = /\u001b\][^\u0007\u001b]*(?:\u0007|\u001b\\)/g;
 const ANSI_CSI_PATTERN = /\u001b\[[0-?]*[ -/]*[@-~]/g;
@@ -443,7 +453,11 @@ export class SSHConnectionManager {
       });
 
       try {
-        const sshConfig = await this.buildClientConfig(key, config);
+        const { keyboard, ...sshConfig } = await this.buildClientConfig(key, config);
+        // ssh2 通过事件下发交互提示，必须在连接前注册应答回调。
+        if (keyboard) {
+          client.on("keyboard-interactive", keyboard);
+        }
         client.connect(sshConfig);
       } catch (error) {
         rejectOnce(error);
@@ -1628,8 +1642,8 @@ export class SSHConnectionManager {
   private async buildClientConfig(
     key: string,
     config: SSHConfig,
-  ): Promise<Record<string, unknown>> {
-    const sshConfig: Record<string, unknown> = {
+  ): Promise<SshClientConfig> {
+    const sshConfig: SshClientConfig = {
       host: config.host,
       port: config.port,
       username: config.username,
@@ -1756,7 +1770,7 @@ export class SSHConnectionManager {
         name: string,
         instructions: string,
         instructionsLang: string,
-        prompts: Array<{ prompt: string; echo: boolean }>,
+        prompts: Prompt[],
         finish: (responses: string[]) => void,
       ) => {
         Logger.log(

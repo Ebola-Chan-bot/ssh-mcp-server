@@ -216,12 +216,12 @@ export class CommandLineParser {
         ? findDefaultAgent()
         : undefined;
 
-      // OpenSSH 风格回退：SSH config 命中了主机别名，但没有提供任何认证信息（无 IdentityFile / password / agent）时，模仿 ssh 客户端自动尝试 ~/.ssh 下的默认身份文件（id_rsa、id_ecdsa、id_ed25519 等）
-      const defaultPrivateKey =
+      // OpenSSH 风格回退：SSH config 命中了主机别名，但没有提供任何认证信息（无 IdentityFile / password / agent）时，模仿 ssh 客户端依次尝试 ~/.ssh 下的默认身份文件（id_rsa、id_ecdsa、id_ed25519 等）；第一把被服务器拒绝认证时连接层自动换下一把重试，而不是只试存在的第一把文件
+      const defaultPrivateKeys =
         !privateKey && !password && !resolvedAgent && sshConfigEntry
-          ? findDefaultIdentityFile()
-          : undefined;
-      const effectivePrivateKey = privateKey || defaultPrivateKey;
+          ? findDefaultIdentityFiles()
+          : [];
+      const effectivePrivateKey = privateKey || defaultPrivateKeys[0];
       const whitelist = values.whitelist;
       const blacklist = values.blacklist;
       const allowedLocalPaths = values["allowed-local-paths"];
@@ -251,6 +251,7 @@ export class CommandLineParser {
         username,
         password,
         privateKey: effectivePrivateKey,
+        privateKeyFallbacks: defaultPrivateKeys.slice(1),
         passphrase,
         agent: resolvedAgent,
         proxy: values.proxy,
@@ -344,6 +345,13 @@ export class CommandLineParser {
       password: config.password,
       privateKey: config.privateKey
         ? this.normalizeLocalPath(String(config.privateKey))
+        : undefined,
+      privateKeyFallbacks: Array.isArray(config.privateKeyFallbacks)
+        ? config.privateKeyFallbacks
+            .map((fallback: unknown) =>
+              this.normalizeLocalPath(String(fallback)),
+            )
+            .filter(Boolean)
         : undefined,
       passphrase: config.passphrase || process.env.SSH_MCP_PASSPHRASE,
       agent: config.agent,
@@ -476,18 +484,14 @@ export class CommandLineParser {
 }
 
 /**
- * 模仿 OpenSSH 的行为：当用户未显式指定私钥、密码或 agent 时，按惯例依次尝试 ~/.ssh 下的默认身份文件（id_rsa、id_ecdsa、id_ed25519、id_xmss、id_dsa），返回第一个存在的公钥对应的私钥路径，否则返回undefined。
+ * 模仿 OpenSSH 的行为：当用户未显式指定私钥、密码或 agent 时，按惯例收集 ~/.ssh 下存在的默认身份文件（id_rsa、id_ecdsa、id_ed25519、id_xmss、id_dsa），按该顺序返回全部命中项供连接端逐把尝试直到认证成功（服务器通常只接受其中一把），一个都不存在时返回空数组。
  */
-function findDefaultIdentityFile(): string | undefined {
+function findDefaultIdentityFiles(): string[] {
   const sshDir = path.join(os.homedir(), ".ssh");
   const defaultNames = ["id_rsa", "id_ecdsa", "id_ed25519", "id_xmss", "id_dsa"];
-  for (const name of defaultNames) {
-    const candidate = path.join(sshDir, name);
-    if (fs.existsSync(candidate)) {
-      return candidate;
-    }
-  }
-  return undefined;
+  return defaultNames
+    .map((name) => path.join(sshDir, name))
+    .filter((candidate) => fs.existsSync(candidate));
 }
 
 /**
